@@ -285,12 +285,12 @@
 		pinctrl-0 = <&cam_front_avdd_default>;
 	};
 	
-	cam_main_avdd_2p85: regulator-cam-main-avdd {
+	cam_main_avdd2_2p85: regulator-cam-main-avdd2 {
 		compatible = "regulator-fixed";
-		regulator-name = "cam_main_avdd_2p85";
+		regulator-name = "cam_main_avdd2_2p85";
 		regulator-min-microvolt = <2856000>;
 		regulator-max-microvolt = <2856000>;
-		gpio = <&tlmm 26 GPIO_ACTIVE_HIGH>;
+		gpio = <&tlmm 156 GPIO_ACTIVE_HIGH>;
 		regulator-enable-ramp-delay = <135>;
 		enable-active-high;
 		regulator-always-on;
@@ -298,12 +298,12 @@
 		pinctrl-0 = <&cam_main_avdd2_default>;
 	};
 	
-	cam_main_avdd_1p8: regulator-cam-main-avdd {
+	cam_main_avdd_1p9: regulator-cam-main-avdd {
 		compatible = "regulator-fixed";
-		regulator-name = "cam_main_avdd_1p8";
-		regulator-min-microvolt = <1800000>;
-		regulator-max-microvolt = <1800000>;
-		gpio = <&tlmm 156 GPIO_ACTIVE_HIGH>;
+		regulator-name = "cam_main_avdd_1p9";
+		regulator-min-microvolt = <1900000>;
+		regulator-max-microvolt = <1900000>;
+		gpio = <&tlmm 26 GPIO_ACTIVE_HIGH>;
 		regulator-enable-ramp-delay = <135>;
 		enable-active-high;
 		regulator-always-on;
