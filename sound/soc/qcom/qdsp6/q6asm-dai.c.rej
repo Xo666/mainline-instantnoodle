@@ -1,0 +1,21 @@
+--- sound/soc/qcom/qdsp6/q6asm-dai.c
++++ sound/soc/qcom/qdsp6/q6asm-dai.c
+@@ -1045,17 +1038,14 @@ static int q6asm_dai_compr_pointer(struct snd_soc_component *component,
+ {
+ 	struct snd_compr_runtime *runtime = stream->runtime;
+ 	struct q6asm_dai_rtd *prtd = runtime->private_data;
+-	unsigned long flags;
+ 	uint64_t temp_copied_total;
+ 
+-	spin_lock_irqsave(&prtd->lock, flags);
++	guard(spinlock_irqsave)(&prtd->lock);
+ 
+ 	tstamp->copied_total = prtd->copied_total;
+ 	temp_copied_total = tstamp->copied_total;
+ 	tstamp->byte_offset = do_div(temp_copied_total, prtd->pcm_size);
+ 
+-	spin_unlock_irqrestore(&prtd->lock, flags);
+-
+ 	return 0;
+ }
+ 
