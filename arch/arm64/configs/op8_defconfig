@@ -5849,7 +5849,7 @@ CONFIG_TYPEC_MUX_NB7VPQ904M=y
 #
 # USB Type-C Alternate Mode drivers
 #
-# CONFIG_TYPEC_DP_ALTMODE is not set
+CONFIG_TYPEC_DP_ALTMODE=y
 # CONFIG_TYPEC_TBT_ALTMODE is not set
 # end of USB Type-C Alternate Mode drivers
 
