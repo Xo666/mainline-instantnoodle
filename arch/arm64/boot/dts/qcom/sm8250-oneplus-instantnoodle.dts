@@ -926,7 +926,7 @@
 		pinctrl-0 = <&cam_front_default>;
 
 		orientation = <0>;
-		rotation = <180>;
+		rotation = <270>;
 
 		port {
 			cam_imx471_ep: endpoint {
