@@ -936,6 +936,14 @@
 			};
 		};
 	};
+	
+	cam_front: eeprom@54 {
+		compatible = "puya,p24c64f",
+			     "atmel,24c64";
+		reg = <0x54>;
+		vcc-supply = <&vreg_l7f_1p8>;
+		read-only;
+	};
 };
 
 &crypto {
