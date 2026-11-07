@@ -256,6 +256,13 @@ struct smb_chip {
 	struct iio_channel *usb_in_v_chan;
 
 	struct power_supply *chg_psy;
+
+	struct delayed_work charge_ctrl_work;
+	struct power_supply *batt_gauge;
+	char gauge_name[32];
+	int charge_end_threshold;
+	int charge_start_threshold;
+	bool charge_inhibited;
 };
 
 struct smb_match_data {
@@ -277,6 +284,9 @@ static enum power_supply_property smb_properties[] = {
 	POWER_SUPPLY_PROP_HEALTH,
 	POWER_SUPPLY_PROP_ONLINE,
 	POWER_SUPPLY_PROP_USB_TYPE,
+	POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR,
+	POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD,
+	POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD,
 };
 
 static bool smb_is_charging(struct smb_chip *chip)
@@ -656,6 +666,124 @@ static int smb_get_prop_health(struct smb_chip *chip, int *val)
 	return -EINVAL;
 }
 
+/*
+ * Charge control: allow userspace to stop charging at a given capacity, which
+ * keeps the battery away from 100% and avoids swelling on devices that are
+ * permanently plugged in.
+ */
+#define SMB_CHARGE_CTRL_POLL_MS	30000
+
+static int smb_set_charge_enable(struct smb_chip *chip, bool enable)
+{
+	return regmap_update_bits(chip->regmap,
+				  chip->base + CHARGING_ENABLE_CMD,
+				  CHARGING_ENABLE_CMD_BIT,
+				  enable ? CHARGING_ENABLE_CMD_BIT : 0);
+}
+
+static int smb_find_gauge_cb(struct power_supply *psy, void *data)
+{
+	struct smb_chip *chip = data;
+	union power_supply_propval val;
+
+	if (psy == chip->chg_psy || psy->desc->type != POWER_SUPPLY_TYPE_BATTERY)
+		return 0;
+	if (power_supply_get_property(psy, POWER_SUPPLY_PROP_CAPACITY, &val))
+		return 0;
+
+	strscpy(chip->gauge_name, psy->desc->name, sizeof(chip->gauge_name));
+	return 1;
+}
+
+static void smb_put_gauge(void *data)
+{
+	power_supply_put(data);
+}
+
+static struct power_supply *smb_get_gauge(struct smb_chip *chip)
+{
+	if (chip->batt_gauge)
+		return chip->batt_gauge;
+
+	chip->gauge_name[0] = '\0';
+	power_supply_for_each_psy(chip, smb_find_gauge_cb);
+	if (!chip->gauge_name[0])
+		return NULL;
+
+	chip->batt_gauge = power_supply_get_by_name(chip->gauge_name);
+	if (!chip->batt_gauge)
+		return NULL;
+
+	if (devm_add_action_or_reset(chip->dev, smb_put_gauge, chip->batt_gauge)) {
+		power_supply_put(chip->batt_gauge);
+		chip->batt_gauge = NULL;
+	}
+
+	return chip->batt_gauge;
+}
+
+static int smb_get_batt_capacity(struct smb_chip *chip, int *val)
+{
+	struct power_supply *gauge = smb_get_gauge(chip);
+	union power_supply_propval prop;
+	int rc;
+
+	if (!gauge)
+		return -ENODEV;
+
+	rc = power_supply_get_property(gauge, POWER_SUPPLY_PROP_CAPACITY, &prop);
+	if (rc)
+		return rc;
+
+	*val = prop.intval;
+	return 0;
+}
+
+static void smb_charge_ctrl_work(struct work_struct *work)
+{
+	struct smb_chip *chip = container_of(work, struct smb_chip,
+					     charge_ctrl_work.work);
+	int capa, start, rc;
+	bool inhibit;
+
+	if (!chip->charge_end_threshold && !chip->charge_start_threshold)
+		return;
+
+	rc = smb_get_batt_capacity(chip, &capa);
+	if (rc < 0) {
+		dev_dbg(chip->dev, "battery capacity unavailable: %d\n", rc);
+		goto resched;
+	}
+
+	inhibit = chip->charge_inhibited;
+	start = chip->charge_start_threshold;
+	if (!start && chip->charge_end_threshold)
+		start = chip->charge_end_threshold > 5 ?
+			chip->charge_end_threshold - 5 : 0;
+
+	if (chip->charge_end_threshold && capa >= chip->charge_end_threshold)
+		inhibit = true;
+	else if (capa <= start)
+		inhibit = false;
+
+	if (inhibit != chip->charge_inhibited) {
+		rc = smb_set_charge_enable(chip, !inhibit);
+		if (rc < 0) {
+			dev_err(chip->dev, "failed to %s charging: %d\n",
+				inhibit ? "inhibit" : "enable", rc);
+		} else {
+			chip->charge_inhibited = inhibit;
+			dev_info(chip->dev, "charging %s at %d%%\n",
+				 inhibit ? "inhibited" : "enabled", capa);
+			power_supply_changed(chip->chg_psy);
+		}
+	}
+
+resched:
+	schedule_delayed_work(&chip->charge_ctrl_work,
+			      msecs_to_jiffies(SMB_CHARGE_CTRL_POLL_MS));
+}
+
 static int smb_get_property(struct power_supply *psy,
 			     enum power_supply_property psp,
 			     union power_supply_propval *val)
@@ -690,6 +818,17 @@ static int smb_get_property(struct power_supply *psy,
 		return smb_get_prop_health(chip, &val->intval);
 	case POWER_SUPPLY_PROP_USB_TYPE:
 		return smb_apsd_get_charger_type(chip, &val->intval);
+	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
+		val->intval = chip->charge_inhibited ?
+			POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE :
+			POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO;
+		return 0;
+	case POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD:
+		val->intval = chip->charge_end_threshold;
+		return 0;
+	case POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD:
+		val->intval = chip->charge_start_threshold;
+		return 0;
 	default:
 		dev_err(chip->dev, "invalid property: %d\n", psp);
 		return -EINVAL;
@@ -708,6 +847,33 @@ static int smb_set_property(struct power_supply *psy,
 					  USBIN_SUSPEND_BIT, !val->intval);
 	case POWER_SUPPLY_PROP_CURRENT_MAX:
 		return smb_set_current_limit(chip, val->intval);
+	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
+		switch (val->intval) {
+		case POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO:
+			chip->charge_inhibited = false;
+			return smb_set_charge_enable(chip, true);
+		case POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE:
+			chip->charge_inhibited = true;
+			return smb_set_charge_enable(chip, false);
+		default:
+			return -EINVAL;
+		}
+	case POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD:
+	case POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD:
+		if (val->intval < 0 || val->intval > 100)
+			return -EINVAL;
+		if (psp == POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD)
+			chip->charge_end_threshold = val->intval;
+		else
+			chip->charge_start_threshold = val->intval;
+		/* Clearing both thresholds must not leave charging inhibited. */
+		if (!chip->charge_end_threshold && !chip->charge_start_threshold &&
+		    chip->charge_inhibited) {
+			chip->charge_inhibited = false;
+			return smb_set_charge_enable(chip, true);
+		}
+		schedule_delayed_work(&chip->charge_ctrl_work, 0);
+		return 0;
 	default:
 		dev_err(chip->dev, "No setter for property: %d\n", psp);
 		return -EINVAL;
@@ -720,6 +886,9 @@ static int smb_property_is_writable(struct power_supply *psy,
 	switch (psp) {
 	case POWER_SUPPLY_PROP_STATUS:
 	case POWER_SUPPLY_PROP_CURRENT_MAX:
+	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
+	case POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD:
+	case POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD:
 		return 1;
 	default:
 		return 0;
@@ -782,6 +951,8 @@ static const struct power_supply_desc smb_psy_desc = {
 		     BIT(POWER_SUPPLY_USB_TYPE_CDP) |
 		     BIT(POWER_SUPPLY_USB_TYPE_DCP) |
 		     BIT(POWER_SUPPLY_USB_TYPE_UNKNOWN),
+	.charge_behaviours = BIT(POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO) |
+			     BIT(POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE),
 	.properties = smb_properties,
 	.num_properties = ARRAY_SIZE(smb_properties),
 	.get_property = smb_get_property,
@@ -1167,6 +1338,12 @@ static int smb_probe(struct platform_device *pdev)
 	if (rc < 0)
 		return dev_err_probe(chip->dev, rc,
 				     "Couldn't write fast AICL rerun time");
+
+	rc = devm_delayed_work_autocancel(chip->dev, &chip->charge_ctrl_work,
+					  smb_charge_ctrl_work);
+	if (rc)
+		return dev_err_probe(chip->dev, rc,
+				     "Failed to init charge control work\n");
 
 	/* Initialise charger state */
 	schedule_delayed_work(&chip->status_change_work, 0);
