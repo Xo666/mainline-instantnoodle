@@ -1641,3 +1641,8 @@
 &usb_1_qmpphy_out {
 	remote-endpoint = <&pm8150b_typec_mux_in>;
 };
+
+&pm8150b_charger {
+	monitored-battery = <&battery>;
+	status = "okay";
+};
