@@ -15,6 +15,7 @@
 #include <linux/kernel.h>
 #include <linux/minmax.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/platform_device.h>
 #include <linux/pm_wakeirq.h>
 #include <linux/of.h>
@@ -109,7 +110,7 @@ enum smb_generation {
 #define AUTO_SRC_DETECT_BIT				BIT(3)
 #define HVDCP_EN_BIT					BIT(2)
 
-#define USBIN_LOAD_CFG					0x65
+#define USBIN_LOAD_CFG					0x365
 #define ICL_OVERRIDE_AFTER_APSD_BIT			BIT(4)
 
 #define USBIN_ICL_OPTIONS				0x366
@@ -231,6 +232,9 @@ struct smb_init_register {
  * @gen:		Generation of SMBx hardware block
  * @current_step_size_ua: Step size of current limits in uA
  * @current_limit_max_ua: Maximum charging current in uA
+ * @float_min_uv:	Minimum float (CV) voltage the hardware can encode
+ * @float_step_uv:	Float (CV) voltage DAC step size
+ * @charge_lock:	Protects the charge control state below
  * @status_change_work: Worker to handle plug/unplug events
  * @cable_irq:		USB plugin IRQ
  * @wakeup_enabled:	If the cable IRQ will cause a wakeup
@@ -247,6 +251,8 @@ struct smb_chip {
 	enum smb_generation gen;
 	unsigned int current_step_size_ua;
 	unsigned int current_limit_max_ua;
+	unsigned int float_min_uv;
+	unsigned int float_step_uv;
 
 	struct delayed_work status_change_work;
 	int cable_irq;
@@ -258,6 +264,7 @@ struct smb_chip {
 	struct power_supply *chg_psy;
 
 	struct delayed_work charge_ctrl_work;
+	struct mutex charge_lock;
 	struct power_supply *batt_gauge;
 	char gauge_name[32];
 	int charge_end_threshold;
@@ -272,6 +279,8 @@ struct smb_match_data {
 	const struct smb_init_register *init_seq;
 	unsigned int current_step_size_ua;
 	unsigned int current_limit_max_ua;
+	unsigned int float_min_uv;
+	unsigned int float_step_uv;
 };
 
 static enum power_supply_property smb_properties[] = {
@@ -373,7 +382,8 @@ static int smbx_ov_status(struct smb_chip *chip)
 		mask = SMB2_CHARGER_ERROR_STATUS_BAT_OV_BIT;
 		break;
 	case SMB5:
-		reg = BATTERY_CHARGER_STATUS_7;
+		/* BAT_OV lives in STATUS_2 on both generations. */
+		reg = BATTERY_CHARGER_STATUS_2;
 		mask = SMB5_CHARGER_ERROR_STATUS_BAT_OV_BIT;
 		break;
 	}
@@ -382,7 +392,7 @@ static int smbx_ov_status(struct smb_chip *chip)
 	if (rc)
 		return rc;
 
-	return !!(reg & mask);
+	return !!(val & mask);
 }
 
 static int smb_get_prop_status(struct smb_chip *chip, int *val)
@@ -632,26 +642,20 @@ static int smb2_get_prop_health(struct smb_chip *chip, int *val)
 		return rc;
 	}
 
-	switch (stat) {
-	case SMB2_CHARGER_ERROR_STATUS_BAT_OV_BIT:
+	if (stat & SMB2_CHARGER_ERROR_STATUS_BAT_OV_BIT)
 		*val = POWER_SUPPLY_HEALTH_OVERVOLTAGE;
-		return 0;
-	case SMB2_BAT_TEMP_STATUS_TOO_COLD_BIT:
+	else if (stat & SMB2_BAT_TEMP_STATUS_TOO_COLD_BIT)
 		*val = POWER_SUPPLY_HEALTH_COLD;
-		return 0;
-	case SMB2_BAT_TEMP_STATUS_TOO_HOT_BIT:
+	else if (stat & SMB2_BAT_TEMP_STATUS_TOO_HOT_BIT)
 		*val = POWER_SUPPLY_HEALTH_OVERHEAT;
-		return 0;
-	case SMB2_BAT_TEMP_STATUS_COLD_SOFT_LIMIT_BIT:
+	else if (stat & SMB2_BAT_TEMP_STATUS_COLD_SOFT_LIMIT_BIT)
 		*val = POWER_SUPPLY_HEALTH_COOL;
-		return 0;
-	case SMB2_BAT_TEMP_STATUS_HOT_SOFT_LIMIT_BIT:
+	else if (stat & SMB2_BAT_TEMP_STATUS_HOT_SOFT_LIMIT_BIT)
 		*val = POWER_SUPPLY_HEALTH_WARM;
-		return 0;
-	default:
+	else
 		*val = POWER_SUPPLY_HEALTH_GOOD;
-		return 0;
-	}
+
+	return 0;
 }
 
 static int smb_get_prop_health(struct smb_chip *chip, int *val)
@@ -715,7 +719,7 @@ static struct power_supply *smb_get_gauge(struct smb_chip *chip)
 		return NULL;
 
 	if (devm_add_action_or_reset(chip->dev, smb_put_gauge, chip->batt_gauge)) {
-		power_supply_put(chip->batt_gauge);
+		/* The release action has already been run. */
 		chip->batt_gauge = NULL;
 	}
 
@@ -739,12 +743,42 @@ static int smb_get_batt_capacity(struct smb_chip *chip, int *val)
 	return 0;
 }
 
+static int smb_set_charge_behaviour(struct smb_chip *chip, bool inhibit)
+{
+	int rc;
+
+	rc = smb_set_charge_enable(chip, !inhibit);
+	if (rc < 0)
+		return rc;
+
+	chip->charge_inhibited = inhibit;
+	return 0;
+}
+
+/**
+ * smb_locked_set_charge_behaviour - change charge state while holding charge_lock
+ * @chip: charger instance
+ * @inhibit: true to inhibit charging, false to allow it
+ *
+ * Kept in its own function on purpose: two guard(mutex) declarations sitting in
+ * sibling case labels of the same switch block share one block scope, so both
+ * cleanups run on the way out and the mutex is unlocked twice.
+ */
+static int smb_locked_set_charge_behaviour(struct smb_chip *chip, bool inhibit)
+{
+	guard(mutex)(&chip->charge_lock);
+
+	return smb_set_charge_behaviour(chip, inhibit);
+}
+
 static void smb_charge_ctrl_work(struct work_struct *work)
 {
 	struct smb_chip *chip = container_of(work, struct smb_chip,
 					     charge_ctrl_work.work);
 	int capa, start, rc;
 	bool inhibit;
+
+	guard(mutex)(&chip->charge_lock);
 
 	/*
 	 * Nothing to enforce: stop polling.  Writing a threshold from sysfs
@@ -771,12 +805,11 @@ static void smb_charge_ctrl_work(struct work_struct *work)
 		inhibit = false;
 
 	if (inhibit != chip->charge_inhibited) {
-		rc = smb_set_charge_enable(chip, !inhibit);
+		rc = smb_set_charge_behaviour(chip, inhibit);
 		if (rc < 0) {
 			dev_err(chip->dev, "failed to %s charging: %d\n",
 				inhibit ? "inhibit" : "enable", rc);
 		} else {
-			chip->charge_inhibited = inhibit;
 			dev_info(chip->dev, "charging %s at %d%%\n",
 				 inhibit ? "inhibited" : "enabled", capa);
 			power_supply_changed(chip->chg_psy);
@@ -854,16 +887,17 @@ static int smb_set_property(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
 		switch (val->intval) {
 		case POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO:
-			chip->charge_inhibited = false;
-			return smb_set_charge_enable(chip, true);
+			return smb_locked_set_charge_behaviour(chip, false);
 		case POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE:
-			chip->charge_inhibited = true;
-			return smb_set_charge_enable(chip, false);
+			return smb_locked_set_charge_behaviour(chip, true);
 		default:
 			return -EINVAL;
 		}
 	case POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD:
 	case POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD:
+	{
+		guard(mutex)(&chip->charge_lock);
+
 		if (val->intval < 0 || val->intval > 100)
 			return -EINVAL;
 		if (psp == POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD)
@@ -872,10 +906,8 @@ static int smb_set_property(struct power_supply *psy,
 			chip->charge_start_threshold = val->intval;
 		/* Clearing both thresholds must not leave charging inhibited. */
 		if (!chip->charge_end_threshold && !chip->charge_start_threshold &&
-		    chip->charge_inhibited) {
-			chip->charge_inhibited = false;
-			return smb_set_charge_enable(chip, true);
-		}
+		    chip->charge_inhibited)
+			return smb_set_charge_behaviour(chip, false);
 		/*
 		 * Use mod_delayed_work(): a poll may already be pending and
 		 * schedule_delayed_work() would silently keep the old delay,
@@ -883,6 +915,7 @@ static int smb_set_property(struct power_supply *psy,
 		 */
 		mod_delayed_work(system_wq, &chip->charge_ctrl_work, 0);
 		return 0;
+	}
 	default:
 		dev_err(chip->dev, "No setter for property: %d\n", psp);
 		return -EINVAL;
@@ -982,7 +1015,7 @@ static const struct smb_init_register smb5_init_seq[] = {
 	{ .addr = SMB5_TYPEC_TYPE_C_VCONN_CONTROL,
 	  .mask = SMB5_VCONN_EN_ORIENTATION_BIT | SMB5_VCONN_EN_SRC_BIT |
 		  SMB5_VCONN_EN_VALUE_BIT,
-	  .val = SMB2_VCONN_EN_SRC_BIT },
+	  .val = SMB5_VCONN_EN_SRC_BIT },
 	{ .addr = SMB5_DEBUG_ACCESS_SRC_CFG,
 	  .mask = SMB5_EN_UNORIENTED_DEBUG_ACCESS_SRC_BIT,
 	  .val = SMB5_EN_UNORIENTED_DEBUG_ACCESS_SRC_BIT },
@@ -1070,11 +1103,7 @@ static const struct smb_init_register smb2_init_seq[] = {
 	  .mask = SMB2_SOC_LT_CHG_RECHARGE_THRESH_SEL_BIT |
 		  SMB2_VBT_LT_CHG_RECHARGE_THRESH_SEL_BIT,
 	  .val = SMB2_VBT_LT_CHG_RECHARGE_THRESH_SEL_BIT },
-	/* Enable charging */
 	{ .addr = USBIN_OPTIONS_1_CFG, .mask = HVDCP_EN_BIT, .val = 0 },
-	{ .addr = CHARGING_ENABLE_CMD,
-	  .mask = CHARGING_ENABLE_CMD_BIT,
-	  .val = CHARGING_ENABLE_CMD_BIT },
 	/*
 	 * Match downstream defaults
 	 * CHG_EN_SRC_BIT - charger enable is controlled by software
@@ -1095,6 +1124,14 @@ static const struct smb_init_register smb2_init_seq[] = {
 		  AUTO_RECHG_BIT | EN_ANALOG_DROP_IN_VBATT_BIT |
 		  CHARGER_INHIBIT_BIT,
 	  .val = CHARGER_INHIBIT_BIT },
+	/*
+	 * Enable charging only once CHGR_CFG2 has selected software control,
+	 * otherwise the enable command can be dropped by the hardware and the
+	 * charger stays disabled after a watchdog reset.
+	 */
+	{ .addr = CHARGING_ENABLE_CMD,
+	  .mask = CHARGING_ENABLE_CMD_BIT,
+	  .val = CHARGING_ENABLE_CMD_BIT },
 	/* STAT pin software override, match downstream. Parallel charging? */
 	{ .addr = STAT_CFG,
 	  .mask = STAT_SW_OVERRIDE_CFG_BIT,
@@ -1145,6 +1182,8 @@ struct smb_match_data pmi8998_match_data = {
 	.gen = SMB2,
 	.current_step_size_ua = 25000,
 	.current_limit_max_ua = 4800000,
+	.float_min_uv = 3487500,
+	.float_step_uv = 7500,
 };
 
 struct smb_match_data pm660_match_data = {
@@ -1154,6 +1193,8 @@ struct smb_match_data pm660_match_data = {
 	.gen = SMB2,
 	.current_step_size_ua = 25000,
 	.current_limit_max_ua = 4800000,
+	.float_min_uv = 3487500,
+	.float_step_uv = 7500,
 };
 
 struct smb_match_data pm8150b_match_data = {
@@ -1163,6 +1204,8 @@ struct smb_match_data pm8150b_match_data = {
 	.gen = SMB5,
 	.current_step_size_ua = 50000,
 	.current_limit_max_ua = 5000000,
+	.float_min_uv = 3600000,
+	.float_step_uv = 10000,
 };
 
 struct smb_match_data pm7250b_match_data = {
@@ -1172,6 +1215,8 @@ struct smb_match_data pm7250b_match_data = {
 	.gen = SMB5,
 	.current_step_size_ua = 50000,
 	.current_limit_max_ua = 5000000,
+	.float_min_uv = 3600000,
+	.float_step_uv = 10000,
 };
 
 
@@ -1223,6 +1268,7 @@ static int smb_probe(struct platform_device *pdev)
 	struct power_supply_desc *desc;
 	struct smb_chip *chip;
 	const struct smb_match_data *match_data;
+	unsigned int volt_uv;
 	int rc, irq;
 
 	chip = devm_kzalloc(&pdev->dev, sizeof(*chip), GFP_KERNEL);
@@ -1258,6 +1304,9 @@ static int smb_probe(struct platform_device *pdev)
 	chip->gen = match_data->gen;
 	chip->current_step_size_ua = match_data->current_step_size_ua;
 	chip->current_limit_max_ua = match_data->current_limit_max_ua;
+	chip->float_min_uv = match_data->float_min_uv;
+	chip->float_step_uv = match_data->float_step_uv;
+	mutex_init(&chip->charge_lock);
 
 	dev_info(chip->dev, "Generation %s\n", chip->gen == SMB2 ? "SMB2" : "SMB5");
 
@@ -1297,7 +1346,24 @@ static int smb_probe(struct platform_device *pdev)
 		return dev_err_probe(chip->dev, rc,
 				     "Failed to init status change work\n");
 
-	rc = (chip->batt_info->voltage_max_design_uv - 3487500) / 7500 + 1;
+	/*
+	 * The float voltage DAC is not encoded the same way on both
+	 * generations: SMB2 starts at 3.4875 V with 7.5 mV steps, SMB5 at
+	 * 3.6 V with 10 mV steps.  Using the SMB2 formula on SMB5 asks for a
+	 * constant voltage above 4.8 V, which overcharges the pack.
+	 */
+	if (power_supply_battery_info_has_prop(chip->batt_info,
+					       POWER_SUPPLY_PROP_CONSTANT_CHARGE_VOLTAGE_MAX))
+		volt_uv = chip->batt_info->constant_charge_voltage_max_uv;
+	else
+		volt_uv = chip->batt_info->voltage_max_design_uv;
+
+	if (volt_uv < chip->float_min_uv)
+		volt_uv = chip->float_min_uv;
+
+	rc = (volt_uv - chip->float_min_uv) / chip->float_step_uv;
+	rc = min_t(int, rc, FLOAT_VOLTAGE_SETTING_MASK);
+	dev_info(chip->dev, "Float voltage %u uV (code %d)\n", volt_uv, rc);
 	rc = regmap_update_bits(chip->regmap, chip->base + FLOAT_VOLTAGE_CFG,
 				FLOAT_VOLTAGE_SETTING_MASK, rc);
 	if (rc < 0)
