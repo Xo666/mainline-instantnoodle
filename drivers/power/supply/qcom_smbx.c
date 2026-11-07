@@ -746,6 +746,10 @@ static void smb_charge_ctrl_work(struct work_struct *work)
 	int capa, start, rc;
 	bool inhibit;
 
+	/*
+	 * Nothing to enforce: stop polling.  Writing a threshold from sysfs
+	 * re-arms this work, so no state is lost by returning here.
+	 */
 	if (!chip->charge_end_threshold && !chip->charge_start_threshold)
 		return;
 
@@ -872,7 +876,12 @@ static int smb_set_property(struct power_supply *psy,
 			chip->charge_inhibited = false;
 			return smb_set_charge_enable(chip, true);
 		}
-		schedule_delayed_work(&chip->charge_ctrl_work, 0);
+		/*
+		 * Use mod_delayed_work(): a poll may already be pending and
+		 * schedule_delayed_work() would silently keep the old delay,
+		 * leaving the new thresholds unenforced until that poll runs.
+		 */
+		mod_delayed_work(system_wq, &chip->charge_ctrl_work, 0);
 		return 0;
 	default:
 		dev_err(chip->dev, "No setter for property: %d\n", psp);
