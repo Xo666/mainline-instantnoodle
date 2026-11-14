@@ -13,9 +13,17 @@
 #include <linux/module.h>
 #include <linux/mod_devicetable.h>
 #include <linux/regmap.h>
+#include <linux/regulator/consumer.h>
+#include <linux/property.h>
+#include <linux/of.h>
 #include <linux/iio/events.h>
 #include <linux/iio/iio.h>
 #include <linux/iio/sysfs.h>
+
+static const char * const stk3310_regulator_names[] = {
+	"vdd",
+	"vddio",
+};
 
 #define STK3310_REG_STATE			0x00
 #define STK3310_REG_PSCTRL			0x01
@@ -487,19 +495,36 @@ static int stk3310_init(struct iio_dev *indio_dev)
 	struct stk3310_data *data = iio_priv(indio_dev);
 	struct i2c_client *client = data->client;
 
-	ret = regmap_read(data->regmap, STK3310_REG_ID, &chipid);
-	if (ret < 0)
+	for (int i = 0; i < 3; i++) {
+		ret = regmap_read(data->regmap, STK3310_REG_ID, &chipid);
+		if (ret == 0)
+			break;
+		usleep_range(5000, 10000);
+	}
+	if (ret < 0) {
+		dev_err(&client->dev, "failed to read chip ID: %d\n", ret);
 		return ret;
+	}
 
 	ret = stk3310_check_chip_id(chipid);
 	if (ret < 0)
 		dev_info(&client->dev, "new unknown chip id: 0x%x\n", chipid);
+	else
+		dev_info(&client->dev, "found supported chip id: 0x%x\n", chipid);
 
 	state = STK3310_STATE_EN_ALS | STK3310_STATE_EN_PS;
 	ret = stk3310_set_state(data, state);
 	if (ret < 0) {
 		dev_err(&client->dev, "failed to enable sensor");
 		return ret;
+	}
+
+	if (of_device_is_compatible(client->dev.of_node, "sensortek,stk33502")) {
+		/* Boost IR LED current & pulse width to penetrate under-display AMOLED panel */
+		regmap_write(data->regmap, STK3310_REG_PSCTRL, 0x23);
+		regmap_write(data->regmap, 0x03, 0x80);
+		/* Under-display ALS integration time ~95ms for accurate lux sensing */
+		regmap_field_write(data->reg_als_it, 9);
 	}
 
 	/* Enable PS interrupts */
@@ -606,6 +631,15 @@ static int stk3310_probe(struct i2c_client *client)
 	struct iio_dev *indio_dev;
 	struct stk3310_data *data;
 
+	ret = devm_regulator_bulk_get_enable(&client->dev,
+					     ARRAY_SIZE(stk3310_regulator_names),
+					     stk3310_regulator_names);
+	if (ret)
+		return dev_err_probe(&client->dev, ret, "failed to enable regulators\n");
+
+	/* Allow 10ms for chip power-on reset (POR) to settle */
+	usleep_range(10000, 15000);
+
 	indio_dev = devm_iio_device_alloc(&client->dev, sizeof(*data));
 	if (!indio_dev)
 		return -ENOMEM;
@@ -633,17 +667,28 @@ static int stk3310_probe(struct i2c_client *client)
 	if (ret < 0)
 		return ret;
 
+	if (data->ps_near_level) {
+		__be16 buf = cpu_to_be16(data->ps_near_level);
+
+		regmap_bulk_write(data->regmap, STK3310_REG_THDH_PS, &buf, 2);
+		buf = cpu_to_be16(data->ps_near_level * 9 / 10);
+		regmap_bulk_write(data->regmap, STK3310_REG_THDL_PS, &buf, 2);
+	}
+
 	if (client->irq > 0) {
+		unsigned long irq_flags = irq_get_trigger_type(client->irq);
+
+		if (!irq_flags)
+			irq_flags = IRQF_TRIGGER_FALLING;
+
 		ret = devm_request_threaded_irq(&client->dev, client->irq,
 						stk3310_irq_handler,
 						stk3310_irq_event_handler,
-						IRQF_TRIGGER_FALLING |
-						IRQF_ONESHOT,
+						irq_flags | IRQF_ONESHOT,
 						"stk3310_event", indio_dev);
 		if (ret < 0) {
-			dev_err(&client->dev, "request irq %d failed\n",
-				client->irq);
-			goto err_standby;
+			dev_warn(&client->dev, "request irq %d failed (%d), falling back to polling\n",
+				 client->irq, ret);
 		}
 	}
 
@@ -699,6 +744,7 @@ static const struct i2c_device_id stk3310_i2c_id[] = {
 	{ "STK3310" },
 	{ "STK3311" },
 	{ "STK3335" },
+	{ "STK33502" },
 	{ }
 };
 MODULE_DEVICE_TABLE(i2c, stk3310_i2c_id);
@@ -717,6 +763,7 @@ static const struct of_device_id stk3310_of_match[] = {
 	{ .compatible = "sensortek,stk3310", },
 	{ .compatible = "sensortek,stk3311", },
 	{ .compatible = "sensortek,stk3335", },
+	{ .compatible = "sensortek,stk33502", },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, stk3310_of_match);

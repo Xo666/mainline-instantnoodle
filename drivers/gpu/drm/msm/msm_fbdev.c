@@ -132,7 +132,7 @@ int msm_fbdev_driver_fbdev_probe(struct drm_fb_helper *helper,
 	helper->fb = fb;
 
 	fbi->fbops = &msm_fb_ops;
-
+	fbi->flags |= FBINFO_VIRTFB;
 	drm_fb_helper_fill_info(fbi, helper, sizes);
 
 	fbi->screen_buffer = msm_gem_get_vaddr(bo);

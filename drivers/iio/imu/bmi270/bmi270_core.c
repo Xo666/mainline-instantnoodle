@@ -93,6 +93,10 @@
 #define BMI270_INIT_CTRL_REG				0x59
 #define BMI270_INIT_CTRL_LOAD_DONE_MSK			BIT(0)
 
+#define BMI270_INIT_ADDR_0_REG				0x5b
+#define BMI270_INIT_ADDR_1_REG				0x5c
+#define BMI270_INIT_DATA_CHUNK_SIZE			64
+
 #define BMI270_INIT_DATA_REG				0x5e
 
 #define BMI270_PWR_CONF_REG				0x7c
@@ -105,6 +109,9 @@
 #define BMI270_PWR_CTRL_GYR_EN_MSK			BIT(1)
 #define BMI270_PWR_CTRL_ACCEL_EN_MSK			BIT(2)
 #define BMI270_PWR_CTRL_TEMP_EN_MSK			BIT(3)
+
+#define BMI270_CMD_REG					0x7e
+#define BMI270_CMD_SOFT_RESET				0xb6
 
 #define BMI270_STEP_SC26_WTRMRK_MSK			GENMASK(9, 0)
 #define BMI270_STEP_SC26_RST_CNT_MSK			BIT(10)
@@ -157,6 +164,7 @@ struct bmi270_data {
 	const struct bmi270_chip_info *chip_info;
 	enum bmi270_irq_pin irq_pin;
 	struct iio_trigger *trig;
+	struct iio_mount_matrix orientation;
 	 /* Protect device's private data from concurrent access */
 	struct mutex mutex;
 	bool steps_enabled;
@@ -1263,6 +1271,20 @@ static const struct iio_info bmi270_info = {
 	.event_attrs = &bmi270_event_attribute_group,
 };
 
+static const struct iio_mount_matrix *
+bmi270_get_mount_matrix(const struct iio_dev *indio_dev,
+			const struct iio_chan_spec *chan)
+{
+	struct bmi270_data *data = iio_priv(indio_dev);
+
+	return &data->orientation;
+}
+
+static const struct iio_chan_spec_ext_info bmi270_ext_info[] = {
+	IIO_MOUNT_MATRIX(IIO_SHARED_BY_TYPE, bmi270_get_mount_matrix),
+	{ }
+};
+
 #define BMI270_ACCEL_CHANNEL(_axis) {				\
 	.type = IIO_ACCEL,					\
 	.modified = 1,						\
@@ -1280,6 +1302,7 @@ static const struct iio_info bmi270_info = {
 		.storagebits = 16,				\
 		.endianness = IIO_LE,				\
 	},	                                                \
+	.ext_info = bmi270_ext_info,				\
 	.event_spec = &bmi270_anymotion_event,			\
 	.num_event_specs = 1,					\
 }
@@ -1301,6 +1324,7 @@ static const struct iio_info bmi270_info = {
 		.storagebits = 16,				\
 		.endianness = IIO_LE,				\
 	},	                                                \
+	.ext_info = bmi270_ext_info,				\
 }
 
 static const struct iio_chan_spec bmi270_channels[] = {
@@ -1441,6 +1465,8 @@ static int bmi270_trigger_probe(struct bmi270_data *data,
 		return dev_err_probe(data->dev, ret,
 				     "Trigger registration failed\n");
 
+	indio_dev->trig = iio_trigger_get(data->trig);
+
 	/* Disable axes for motion events */
 	ret = bmi270_update_feature_reg(data, BMI270_ANYMO1_REG,
 					BMI270_FEAT_MOTION_XYZ_EN_MSK,
@@ -1453,16 +1479,68 @@ static int bmi270_trigger_probe(struct bmi270_data *data,
 	return 0;
 }
 
+static int bmi270_soft_reset(struct bmi270_data *data)
+{
+	int ret;
+	int dummy;
+
+	/*
+	 * On cold boot, the device powers up in I2C mode. The first SPI
+	 * transaction toggles CSB and switches the interface to SPI mode.
+	 * Perform an initial dummy read so that the subsequent soft-reset
+	 * command over SPI is properly received.
+	 */
+	regmap_read(data->regmap, BMI270_CHIP_ID_REG, &dummy);
+	usleep_range(2000, 5000);
+
+	ret = regmap_write(data->regmap, BMI270_CMD_REG, BMI270_CMD_SOFT_RESET);
+	if (ret)
+		return ret;
+
+	usleep_range(20000, 30000);
+
+	/*
+	 * Performing a dummy read to bring interface back to SPI from
+	 * I2C after a soft-reset.
+	 */
+	regmap_read(data->regmap, BMI270_CHIP_ID_REG, &dummy);
+	usleep_range(2000, 5000);
+
+	return 0;
+}
+
 static int bmi270_validate_chip_id(struct bmi270_data *data)
 {
-	int chip_id;
+	int chip_id = 0;
 	int ret;
+	int retry;
 	struct device *dev = data->dev;
 	struct regmap *regmap = data->regmap;
 
-	ret = regmap_read(regmap, BMI270_CHIP_ID_REG, &chip_id);
-	if (ret)
-		return dev_err_probe(dev, ret, "Failed to read chip id");
+	/*
+	 * Retry reading chip ID. On cold boot the sensor power rail or
+	 * internal ASIC startup may take up to 50-100ms.
+	 */
+	for (retry = 0; retry < 15; retry++) {
+		ret = regmap_read(regmap, BMI270_CHIP_ID_REG, &chip_id);
+		if (ret)
+			return dev_err_probe(dev, ret, "Failed to read chip id\n");
+
+		if (chip_id == bmi260_chip_info.chip_id ||
+		    chip_id == bmi270_chip_info.chip_id ||
+		    chip_id == BMI160_CHIP_ID_VAL)
+			break;
+
+		usleep_range(10000, 15000);
+	}
+
+	/*
+	 * If the chip still returned 0x0, the power rail or device might
+	 * not be ready yet. Defer probe so the kernel can retry later.
+	 */
+	if (chip_id == 0)
+		return dev_err_probe(dev, -EPROBE_DEFER,
+				     "Sensor not ready (chip_id 0x0), deferring probe\n");
 
 	/*
 	 * Some manufacturers use "BMI0160" for both the BMI160 and
@@ -1473,12 +1551,15 @@ static int bmi270_validate_chip_id(struct bmi270_data *data)
 		return -ENODEV;
 
 	if (chip_id != data->chip_info->chip_id)
-		dev_info(dev, "Unexpected chip id 0x%x", chip_id);
+		dev_info(dev, "Unexpected chip id 0x%x\n", chip_id);
 
 	if (chip_id == bmi260_chip_info.chip_id)
 		data->chip_info = &bmi260_chip_info;
 	else if (chip_id == bmi270_chip_info.chip_id)
 		data->chip_info = &bmi270_chip_info;
+	else
+		return dev_err_probe(dev, -ENODEV,
+				     "Unknown or invalid chip id 0x%x\n", chip_id);
 
 	return 0;
 }
@@ -1487,44 +1568,73 @@ static int bmi270_write_calibration_data(struct bmi270_data *data)
 {
 	int ret;
 	int status = 0;
+	size_t index;
 	const struct firmware *init_data;
 	struct device *dev = data->dev;
 	struct regmap *regmap = data->regmap;
 
-	ret = regmap_clear_bits(regmap, BMI270_PWR_CONF_REG,
-				BMI270_PWR_CONF_ADV_PWR_SAVE_MSK);
+	/* Disable advanced power save mode */
+	ret = regmap_write(regmap, BMI270_PWR_CONF_REG, 0x00);
 	if (ret)
 		return dev_err_probe(dev, ret,
-				     "Failed to write power configuration");
+				     "Failed to write power configuration\n");
 
 	/*
 	 * After disabling advanced power save, all registers are accessible
 	 * after a 450us delay. This delay is specified in table A of the
 	 * datasheet.
 	 */
-	usleep_range(450, 1000);
+	usleep_range(1000, 2000);
 
-	ret = regmap_clear_bits(regmap, BMI270_INIT_CTRL_REG,
-				BMI270_INIT_CTRL_LOAD_DONE_MSK);
+	/* Prepare device to load init data */
+	ret = regmap_write(regmap, BMI270_INIT_CTRL_REG, 0x00);
 	if (ret)
 		return dev_err_probe(dev, ret,
-				     "Failed to prepare device to load init data");
+				     "Failed to prepare device to load init data\n");
+
+	usleep_range(1000, 2000);
 
 	ret = request_firmware(&init_data, data->chip_info->fw_name, dev);
 	if (ret)
-		return dev_err_probe(dev, ret, "Failed to load init data file");
+		return dev_err_probe(dev, ret, "Failed to load init data file\n");
 
-	ret = regmap_bulk_write(regmap, BMI270_INIT_DATA_REG,
-				init_data->data, init_data->size);
+	for (index = 0; index < init_data->size; index += BMI270_INIT_DATA_CHUNK_SIZE) {
+		size_t chunk = min_t(size_t, BMI270_INIT_DATA_CHUNK_SIZE,
+				     init_data->size - index);
+		u16 word_addr = index / 2;
+
+		ret = regmap_write(regmap, BMI270_INIT_ADDR_0_REG,
+				   word_addr & 0x0f);
+		if (ret) {
+			release_firmware(init_data);
+			return dev_err_probe(dev, ret,
+					     "Failed to write init addr 0\n");
+		}
+
+		ret = regmap_write(regmap, BMI270_INIT_ADDR_1_REG,
+				   (word_addr >> 4) & 0xff);
+		if (ret) {
+			release_firmware(init_data);
+			return dev_err_probe(dev, ret,
+					     "Failed to write init addr 1\n");
+		}
+
+		ret = regmap_bulk_write(regmap, BMI270_INIT_DATA_REG,
+					&init_data->data[index], chunk);
+		if (ret) {
+			release_firmware(init_data);
+			return dev_err_probe(dev, ret,
+					     "Failed to write init data chunk\n");
+		}
+	}
 	release_firmware(init_data);
-	if (ret)
-		return dev_err_probe(dev, ret, "Failed to write init data");
 
-	ret = regmap_set_bits(regmap, BMI270_INIT_CTRL_REG,
-			      BMI270_INIT_CTRL_LOAD_DONE_MSK);
+	/* Signal that init data load is complete */
+	ret = regmap_write(regmap, BMI270_INIT_CTRL_REG,
+			   BMI270_INIT_CTRL_LOAD_DONE_MSK);
 	if (ret)
 		return dev_err_probe(dev, ret,
-				     "Failed to stop device initialization");
+				     "Failed to stop device initialization\n");
 
 	/*
 	 * Wait at least 140ms for the device to complete configuration.
@@ -1534,10 +1644,12 @@ static int bmi270_write_calibration_data(struct bmi270_data *data)
 
 	ret = regmap_read(regmap, BMI270_INTERNAL_STATUS_REG, &status);
 	if (ret)
-		return dev_err_probe(dev, ret, "Failed to read internal status");
+		return dev_err_probe(dev, ret, "Failed to read internal status\n");
 
-	if (status != BMI270_INTERNAL_STATUS_MSG_INIT_OK)
-		return dev_err_probe(dev, -ENODEV, "Device failed to initialize");
+	if ((status & BMI270_INTERNAL_STATUS_MSG_MSK) != BMI270_INTERNAL_STATUS_MSG_INIT_OK)
+		return dev_err_probe(dev, -ENODEV,
+				     "Device failed to initialize (status 0x%02x)\n",
+				     status);
 
 	return 0;
 }
@@ -1585,6 +1697,10 @@ static int bmi270_chip_init(struct bmi270_data *data)
 {
 	int ret;
 
+	ret = bmi270_soft_reset(data);
+	if (ret)
+		return ret;
+
 	ret = bmi270_validate_chip_id(data);
 	if (ret)
 		return ret;
@@ -1615,6 +1731,10 @@ int bmi270_core_probe(struct device *dev, struct regmap *regmap,
 	mutex_init(&data->mutex);
 
 	ret = bmi270_chip_init(data);
+	if (ret)
+		return ret;
+
+	ret = iio_read_mount_matrix(dev, &data->orientation);
 	if (ret)
 		return ret;
 

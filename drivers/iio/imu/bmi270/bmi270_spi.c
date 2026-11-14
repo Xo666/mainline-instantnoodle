@@ -14,16 +14,19 @@
  * In section 6.4 of the BMI270 data it specifies that after a read
  * operation the first data byte from the device is a dummy byte
  */
-static int bmi270_regmap_spi_read(void *spi, const void *reg_buf,
+static int bmi270_regmap_spi_read(void *context, const void *reg_buf,
 				  size_t reg_size, void *val_buf,
 				  size_t val_size)
 {
+	struct spi_device *spi = context;
+
 	return spi_write_then_read(spi, reg_buf, reg_size, val_buf, val_size);
 }
 
-static int bmi270_regmap_spi_write(void *spi, const void *data,
+static int bmi270_regmap_spi_write(void *context, const void *data,
 				   size_t count)
 {
+	struct spi_device *spi = context;
 	u8 *data_buff = (u8 *)data;
 
 	/*
@@ -31,7 +34,7 @@ static int bmi270_regmap_spi_write(void *spi, const void *data,
 	 * operation
 	 */
 	data_buff[1] = data_buff[0];
-	return spi_write_then_read(spi, data_buff + 1, count - 1, NULL, 0);
+	return spi_write(spi, data_buff + 1, count - 1);
 }
 
 static const struct regmap_bus bmi270_regmap_bus = {
@@ -56,7 +59,7 @@ static int bmi270_spi_probe(struct spi_device *spi)
 	if (!chip_info)
 		return -ENODEV;
 
-	regmap = devm_regmap_init(dev, &bmi270_regmap_bus, dev,
+	regmap = devm_regmap_init(dev, &bmi270_regmap_bus, spi,
 				  &bmi270_spi_regmap_config);
 	if (IS_ERR(regmap))
 		return dev_err_probe(dev, PTR_ERR(regmap),
@@ -70,12 +73,14 @@ static const struct spi_device_id bmi270_spi_id[] = {
 	{ "bmi270", (kernel_ulong_t)&bmi270_chip_info },
 	{ }
 };
+MODULE_DEVICE_TABLE(spi, bmi270_spi_id);
 
 static const struct of_device_id bmi270_of_match[] = {
 	{ .compatible = "bosch,bmi260", .data = &bmi260_chip_info },
 	{ .compatible = "bosch,bmi270", .data = &bmi270_chip_info },
 	{ }
 };
+MODULE_DEVICE_TABLE(of, bmi270_of_match);
 
 static struct spi_driver bmi270_spi_driver = {
 	.driver = {

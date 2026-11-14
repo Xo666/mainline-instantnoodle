@@ -113,7 +113,8 @@ static const struct snd_pcm_hardware q6asm_dai_hardware_playback = {
 				SNDRV_PCM_INFO_INTERLEAVED |
 				SNDRV_PCM_INFO_PAUSE | SNDRV_PCM_INFO_RESUME),
 	.formats =              (SNDRV_PCM_FMTBIT_S16_LE |
-				SNDRV_PCM_FMTBIT_S24_LE),
+				SNDRV_PCM_FMTBIT_S24_LE |
+				SNDRV_PCM_FMTBIT_S32_LE),
 	.rates =                SNDRV_PCM_RATE_8000_192000,
 	.rate_min =             8000,
 	.rate_max =             192000,
@@ -138,8 +139,7 @@ static const struct snd_pcm_hardware q6asm_dai_hardware_playback = {
 				  SNDRV_PCM_RATE_96000 |		\
 				  SNDRV_PCM_RATE_176400 |		\
 				  SNDRV_PCM_RATE_192000),		\
-			.formats = (SNDRV_PCM_FMTBIT_S16_LE |		\
-					SNDRV_PCM_FMTBIT_S24_LE),	\
+			.formats = (SNDRV_PCM_FMTBIT_S32_LE),		\
 			.channels_min = 1,				\
 			.channels_max = 8,				\
 			.rate_min =     8000,				\
@@ -217,28 +217,32 @@ static int q6asm_dai_prepare(struct snd_soc_component *component,
 	if (!pdata)
 		return -EINVAL;
 
-	if (!prtd || !prtd->audio_client) {
-		dev_err(dev, "%s: private data null or audio client freed\n",
-			__func__);
+	if (!prtd) {
+		dev_err(dev, "%s: private data null\n", __func__);
+		return -EINVAL;
+	}
+
+	if (!prtd->audio_client) {
+		dev_err(dev, "%s: audio client freed\n", __func__);
 		return -EINVAL;
 	}
 
 	prtd->pcm_count = snd_pcm_lib_period_bytes(substream);
-	/* rate and channels are sent to audio driver */
-	if (prtd->state == Q6ASM_STREAM_RUNNING) {
+
+	if (prtd->state != Q6ASM_STREAM_IDLE) {
 		/* clear the previous setup if any  */
 		q6asm_cmd(prtd->audio_client, prtd->stream_id, CMD_CLOSE);
-		q6asm_unmap_memory_regions(substream->stream,
-					   prtd->audio_client);
 		q6routing_stream_close(soc_prtd->dai_link->id,
-					 substream->stream);
+							   substream->stream);
 		prtd->state = Q6ASM_STREAM_STOPPED;
 	}
 
+	q6asm_unmap_memory_regions(substream->stream, prtd->audio_client);
+
 	ret = q6asm_map_memory_regions(substream->stream, prtd->audio_client,
-				       prtd->phys,
-				       (prtd->pcm_size / prtd->periods),
-				       prtd->periods);
+								prtd->phys,
+								(prtd->pcm_size / prtd->periods),
+								prtd->periods);
 
 	if (ret < 0) {
 		dev_err(dev, "Audio Start: Buffer Allocation failed rc = %d\n",
@@ -293,9 +297,11 @@ static int q6asm_dai_prepare(struct snd_soc_component *component,
 
 	return ret;
 
-routing_err:
-	q6asm_cmd(prtd->audio_client, prtd->stream_id,  CMD_CLOSE);
-open_err:
+	routing_err:
+
+	q6routing_stream_close(soc_prtd->dai_link->id, substream->stream);
+	q6asm_cmd(prtd->audio_client, prtd->stream_id, CMD_CLOSE);
+	open_err:
 	q6asm_unmap_memory_regions(substream->stream, prtd->audio_client);
 	q6asm_audio_client_free(prtd->audio_client);
 	prtd->audio_client = NULL;
@@ -472,6 +478,7 @@ static int q6asm_dai_close(struct snd_soc_component *component,
 	return 0;
 }
 
+
 static snd_pcm_uframes_t q6asm_dai_pointer(struct snd_soc_component *component,
 					   struct snd_pcm_substream *substream)
 {
@@ -501,6 +508,7 @@ static int q6asm_dai_hw_params(struct snd_soc_component *component,
 	case SNDRV_PCM_FORMAT_S16_LE:
 		prtd->bits_per_sample = 16;
 		break;
+	case SNDRV_PCM_FORMAT_S32_LE:
 	case SNDRV_PCM_FORMAT_S24_LE:
 		prtd->bits_per_sample = 24;
 		break;

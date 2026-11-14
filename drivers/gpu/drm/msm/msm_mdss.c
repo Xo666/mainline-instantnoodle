@@ -350,6 +350,68 @@ static int msm_mdss_reset(struct device *dev)
 				     "failed to acquire mdss reset\n");
 	}
 
+	if (of_device_is_compatible(dev->of_node, "qcom,sm8250-mdss")) {
+		void __iomem *dispcc = ioremap(0x0af00000, 0x4000);
+
+		if (dispcc) {
+			u32 gdscr = readl_relaxed(dispcc + 0x3000);
+			u32 ahb_cbcr = readl_relaxed(dispcc + 0x2080);
+			u32 mdp_cbcr = readl_relaxed(dispcc + 0x200c);
+			u32 vsync_cbcr = readl_relaxed(dispcc + 0x2024);
+
+			if ((gdscr & BIT(31)) &&
+			    !(ahb_cbcr & BIT(31)) &&
+			    !(mdp_cbcr & BIT(31))) {
+				int i;
+
+				if (vsync_cbcr & BIT(31)) {
+					writel_relaxed(vsync_cbcr | BIT(0),
+						       dispcc + 0x2024);
+					for (i = 0; i < 100; i++) {
+						if (!(readl_relaxed(dispcc + 0x2024) & BIT(31)))
+							break;
+						udelay(1);
+					}
+				}
+
+				if (!(readl_relaxed(dispcc + 0x2024) & BIT(31))) {
+					void __iomem *intf1 = ioremap(0x0ae6b800, 0x2c0);
+					void __iomem *pp0 = ioremap(0x0ae71000, 0x40);
+					u32 intf_ar = 0, intf_te = 0, pp_ar = 0, pp_te = 0;
+
+					if (intf1) {
+						u32 vsync_cfg = readl_relaxed(intf1 + 0x288);
+
+						intf_ar = readl_relaxed(intf1 + 0x2b4);
+						intf_te = readl_relaxed(intf1 + 0x284);
+						writel_relaxed(vsync_cfg & ~BIT(20), intf1 + 0x288);
+						writel_relaxed(0, intf1 + 0x2b4);
+						writel_relaxed(0, intf1 + 0x284);
+						iounmap(intf1);
+					}
+
+					if (pp0) {
+						u32 vsync_cfg = readl_relaxed(pp0 + 0x004);
+
+						pp_ar = readl_relaxed(pp0 + 0x030);
+						pp_te = readl_relaxed(pp0 + 0x000);
+						writel_relaxed(vsync_cfg & ~BIT(20), pp0 + 0x004);
+						writel_relaxed(0, pp0 + 0x030);
+						writel_relaxed(0, pp0 + 0x000);
+						iounmap(pp0);
+					}
+
+					/* Wait one frame for any in-flight DSI transfer to finish */
+					msleep(20);
+					dev_info(dev,
+						 "quiesced bootloader display before reset (intf_ar=0x%x intf_te=0x%x pp_ar=0x%x pp_te=0x%x)\n",
+						 intf_ar, intf_te, pp_ar, pp_te);
+				}
+			}
+			iounmap(dispcc);
+		}
+	}
+
 	reset_control_assert(reset);
 	/*
 	 * Tests indicate that reset has to be held for some period of time,

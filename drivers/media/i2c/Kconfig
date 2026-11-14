@@ -298,6 +298,17 @@ config VIDEO_IMX471
 	  To compile this driver as a module, choose M here: the
 	  module will be called imx471.
 
+config VIDEO_IMX481
+	tristate "Sony IMX481 sensor support"
+	depends on OF_GPIO
+	select V4L2_CCI_I2C
+	help
+	  This is a Video4Linux2 sensor driver for the Sony
+	  IMX481 camera.
+
+	  To compile this driver as a module, choose M here: the
+	  module will be called imx481.
+
 config VIDEO_MAX9271_LIB
 	tristate
 

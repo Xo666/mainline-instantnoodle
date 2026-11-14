@@ -285,5 +285,11 @@ config YAMAHA_YAS530
 	  This driver can also be compiled as a module.
 	  To compile this driver as a module, choose M here: the module
 	  will be called yamaha-yas.
+	  
+config SENSORS_MMC56X3
+	tristate "MMC56X3 3-Axis Magnetometer (I2C)"
+	help
+	  Say Y here to add support for the MMC56X3 3-Axis Magnetometer,
+	  found in OnePlus.
 
 endmenu

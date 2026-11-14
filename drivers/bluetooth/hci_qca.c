@@ -875,7 +875,7 @@ static void device_woke_up(struct hci_uart *hu)
 
 	case HCI_IBS_TX_ASLEEP:
 	default:
-		BT_ERR("Received HCI_IBS_WAKE_ACK in tx state %d",
+		BT_DBG("Received HCI_IBS_WAKE_ACK in tx state %d",
 		       qca->tx_ibs_state);
 		break;
 	}

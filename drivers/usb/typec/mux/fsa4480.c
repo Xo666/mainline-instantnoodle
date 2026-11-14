@@ -96,9 +96,10 @@ static int fsa4480_set(struct fsa4480 *fsa)
 		/* DP Only */
 		case TYPEC_DP_STATE_C:
 		case TYPEC_DP_STATE_E:
-			enable |= FSA4480_ENABLE_SBU;
+			enable |= FSA4480_ENABLE_SBU | FSA4480_ENABLE_USB;
+			sel = FSA4480_SEL_USB;
 			if (reverse)
-				sel = FSA4480_SEL_SBU_REVERSE;
+				sel |= FSA4480_SEL_SBU_REVERSE;
 			break;
 
 		/* DP + USB */
@@ -287,8 +288,8 @@ static int fsa4480_probe(struct i2c_client *client)
 		FIELD_GET(FSA4480_DEVICE_ID_REV_ID, val),
 		FIELD_GET(FSA4480_DEVICE_ID_VENDOR_ID, val));
 
-	/* Safe mode */
-	fsa->cur_enable = FSA4480_ENABLE_DEVICE | FSA4480_ENABLE_USB;
+	/* Safe mode - force USB + SBU */
+	fsa->cur_enable = FSA4480_ENABLE_DEVICE | FSA4480_ENABLE_USB | FSA4480_ENABLE_SBU;
 	fsa->mode = TYPEC_STATE_SAFE;
 	fsa->orientation = TYPEC_ORIENTATION_NONE;
 

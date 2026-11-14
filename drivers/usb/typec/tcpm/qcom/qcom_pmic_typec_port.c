@@ -639,6 +639,7 @@ static int qcom_pmic_typec_port_start(struct pmic_typec *tcpm,
 				      struct tcpm_port *tcpm_port)
 {
 	struct pmic_typec_port *pmic_typec_port = tcpm->pmic_typec_port;
+	unsigned int misc;
 	int i;
 	int mask;
 	int ret;
@@ -655,6 +656,21 @@ static int qcom_pmic_typec_port_start(struct pmic_typec *tcpm,
 			   TYPEC_INTR_EN_CFG_2_MASK);
 	if (ret)
 		goto done;
+
+	/*
+	 * If VBUS_ERROR_STATUS is latched (e.g. external OVP tripped from a
+	 * previous >5V PD session), hold CC open (TYPEC_DISABLE_CMD) long
+	 * enough (> tPDDebounce) for the attached PD source to detect detach
+	 * and reset VBUS back to vSafe0V/vSafe5V before enabling TRY_SNK.
+	 */
+	if (!regmap_read(pmic_typec_port->regmap,
+			 pmic_typec_port->base + TYPEC_MISC_STATUS_REG, &misc) &&
+	    (misc & TYPEC_VBUS_ERROR_STATUS)) {
+		regmap_write(pmic_typec_port->regmap,
+			     pmic_typec_port->base + TYPEC_MODE_CFG_REG,
+			     TYPEC_DISABLE_CMD);
+		msleep(150);
+	}
 
 	/* start in TRY_SNK mode */
 	ret = regmap_write(pmic_typec_port->regmap,
